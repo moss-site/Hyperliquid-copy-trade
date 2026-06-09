@@ -32,6 +32,7 @@ description: Manage the Hyperliquid copy-trading (follow) agent service. Use whe
 3. **跟单启动成功后输出简洁摘要**：启动成功消息保持简洁，但需比日常推送信息更完整，至少包含 Agent、Agent 持仓、初始化执行结果、跟单比例、滑点、币种过滤规则（Hyperliquid 支持币缓存）、主钱包地址、Agent Wallet 地址、Follower ID（若有）、网络和运行状态。不要默认输出止损/止盈或轮询间隔，除非用户刚配置或主动询问。
 4. **讨论充值时必须明确充值目标**：当用户询问充值、补保证金、余额不足怎么办时，Bot 必须明确提醒“请充值到主钱包对应的 Hyperliquid 账户”，不要让用户误解成直接链上转账到主钱包地址本身。
 5. **配置 Agent ID 前给列表页面**：用户授权结束后需要配置 `moss_source.agent_id`，或用户选择/切换跟单 Agent 时，Bot 不能只要求用户输入 `agt_xxx`；必须先提供当前网络对应的 Moss Agent 列表页面（主网 `https://moss.site/agent?mode=realtime`；测试网 `https://alpha.moss.site/agent?mode=realtime`），让用户自行挑选并复制 Agent 链接或 ID。不要编造或内置推荐列表。
+6. **正式开始跟单前必须完成风险参数问答**：在执行 `service start` / `service resume` 之前，用户必须明确回答“是否设置跟单资金比例”和“是否设置止盈或止损点”两个问题；不能用默认值静默跳过，也不能在用户未回答时启动服务。升级后也必须重新提醒并确认这两项配置，即使该实例之前已经启动过或已经配置过。
 
 ---
 
@@ -261,22 +262,78 @@ https://alpha.moss.site/hyperliquid/authorize/0xAbCd...1234
 ### 触发条件
 用户确认跟单某个 Agent 后。
 
+### 必答交互一：是否设置跟单资金比例
+
+Bot 必须先询问，且问题中必须带范围和示例：
+
+```
+您是否需要设置跟单的资金比例？资金比例请输入 0%~100%，例如 30%、50%、100%。
+```
+
+用户必须回答“是/否”后才能继续：
+- **如果回答是**：继续询问“比例是多少？”资金比例请输入 `0%~100%`，例如 `30%`、`50%`、`100%`。用户可输入百分比或小数；Bot 必须按当前配置格式换算成 `0~1` 的小数 `follow_ratio` 后写入配置，例如 `10%` → `follow_ratio=0.1`、`30%` → `follow_ratio=0.3`、`100%` → `follow_ratio=1.0`。不允许大于 100%，如用户输入超过 100% 需提示风险并要求重新输入。
+- **如果回答否**：表示不缩小跟单资金比例，写入或保持 `follow_ratio=1.0`（100%），并在摘要中显示“未自定义，按 100% 跟随账户净值比例”。
+
+对应 CLI：
+
+```bash
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set follow_ratio 0.3
+# 用户选择“不设置”时，避免沿用旧配置：
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set follow_ratio 1.0
+```
+
+### 必答交互二：是否设置止盈或者止损点
+
+Bot 必须继续询问，且问题中必须带范围和示例：
+
+```
+您是否需要设置止盈或者止损点？止损请输入 0%~100%，例如止损 20%；止盈请输入 0%~300%，例如止盈 20%。注意：止盈/止损按保证金盈亏百分比计算，不是价格涨跌幅；由轮询检查触发，非实时 tick，急速行情下实际盈亏可能超过设定值。
+```
+
+用户必须回答“是/否”后才能继续：
+- **如果回答是**：继续询问“止盈或止损的比例是多少？”并明确用户要设置止盈、止损，或两者都设置。止损请输入 `0%~100%`，止盈请输入 `0%~300%`。示例：`止损 20%` → `stop_loss_pct=20`；`止盈 20%` → `take_profit_pct=20`；`止损 15%，止盈 40%` → 同时写入两个字段。止损/止盈配置仍按当前配置需要的百分比数值写入，不转换成小数；止损展示时可显示为 `-20%`。超过范围时必须提示用户重新输入。必须同时说明：止盈/止损按保证金盈亏百分比计算，不是价格涨跌幅；由轮询检查触发，非实时 tick，急速行情下实际盈亏可能超过设定值。
+- **如果回答否**：表示不设置止盈止损，写入 `stop_loss_pct=0` 和 `take_profit_pct=0`，避免沿用旧配置。
+
+对应 CLI：
+
+```bash
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set stop_loss_pct 20
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set take_profit_pct 30
+# 用户选择“不设置”时，避免沿用旧配置：
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set stop_loss_pct 0
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set take_profit_pct 0
+```
+
+### 必答交互完成后的启动确认
+
+完成资金比例和止盈/止损两个必答交互后，Bot 必须执行带三个用户答案的确认命令；不能只问止盈止损，也不能在没问资金比例时执行确认，写入当前 Agent + 风险参数快照；否则 `service start` / `service resume` 会拒绝启动：
+
+```bash
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config confirm-risk --follow-ratio 100% --stop-loss 20% --take-profit 100%
+```
+
+任何时候修改 `follow_ratio`、`stop_loss_pct`、`take_profit_pct` 或 `moss_source.agent_id` 后，确认状态会被清除，必须重新完成两项问答并再次执行 `config confirm-risk --follow-ratio <用户回答> --stop-loss <用户回答> --take-profit <用户回答>`。
+
 ### 参数一：跟单比例
 
-Bot 询问跟单比例：输入百分比（如 50%），每笔按 Agent 仓位的对应比例跟随。当前代码不支持固定金额模式。
+跟单比例来自“必答交互一”。输入百分比（如 50%）时，每笔按 Agent 仓位的对应比例跟随。当前代码不支持固定金额模式。
 
-### 参数二：止损线
+### 参数二：止盈 / 止损线
 
-Bot 询问是否设置止损线：
-- 输入负百分比（如 -20%），亏损超过该比例时自动停止跟单
-- 选择不设置，则持续跟随 Agent，不自动停止
+止盈和止损来自“必答交互二”：
+- 口径：按当前持仓保证金的未实现盈亏百分比计算，不是价格涨跌幅；例如止损 `20%` 表示亏损达到约 20% 保证金时触发
+- 触发：由服务轮询检查，不是实时 tick；急速行情下两次检查之间可能越过阈值，实际盈亏可能超过设定值
+- 杠杆提示：带杠杆时，价格小幅反向也可能造成较高保证金亏损；如持仓 leverage 数据缺失，系统会按 1x 估算保证金，触发会相对更宽松
+- 止损：输入 `0%~100%` 的亏损阈值（如 `20%` 或 `止损 20%`），按百分比数值写入 `stop_loss_pct=20`
+- 止盈：输入 `0%~300%` 的盈利阈值（如 `20%` 或 `止盈 20%`），按百分比数值写入 `take_profit_pct=20`
+- 选择不设置，则 `stop_loss_pct=0` 且 `take_profit_pct=0`
 
 ### 参数三：滑点
 
 杠杆不再作为用户配置项；下单时会跟随 Agent 当前仓位杠杆。用户可调整 IOC 滑点：
 
 ```bash
-.venv/bin/python cli.py config set slippage_percent 1.5
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set slippage_percent 1.5
 ```
 
 ### 参数四：币种过滤规则
@@ -289,6 +346,7 @@ Bot 汇总配置信息供用户确认：
 - Agent 名称
 - 跟单比例
 - 止损线（或「未设置」）
+- 止盈线（或「未设置」）
 - 滑点
 - 币种过滤规则（Hyperliquid 支持币缓存）
 
@@ -301,8 +359,9 @@ Bot 汇总配置信息供用户确认：
 ### 激活成功
 
 ```bash
-.venv/bin/python cli.py service start
-.venv/bin/python cli.py service status
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config confirm-risk --follow-ratio 100% --stop-loss 20% --take-profit 100%
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service start
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service status
 ```
 
 Bot 发送启动成功消息，告知用户 Agent 有新操作时会立即通知。启动成功消息保持简洁，包含关键运行参数和初始化结果即可。
@@ -350,15 +409,15 @@ Bot 发送启动成功消息，告知用户 Agent 有新操作时会立即通知
 - 当前跟单 Agent
 - 今日收益（金额 + 百分比）
 - 今日交易笔数
-- 当前跟单参数（比例、止损线）
+- 当前跟单参数（比例、止损线、止盈线）
 - 最近几笔交易记录（盈亏）
 
 对应 CLI：
 ```bash
-.venv/bin/python cli.py service status
-.venv/bin/python cli.py stats
-.venv/bin/python cli.py trades --limit 10
-.venv/bin/python cli.py balance
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service status
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json stats
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json trades --limit 10
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json balance
 ```
 
 ### 管理指令
@@ -399,7 +458,7 @@ Bot：（执行 service pause）
 
 对应 CLI：
 ```bash
-.venv/bin/python cli.py service pause
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service pause
 ```
 
 `service pause` 会执行：全平仓 → 停止服务 → 清除基线。
@@ -432,8 +491,8 @@ Bot：（执行 service resume）
 
 对应 CLI：
 ```bash
-.venv/bin/python cli.py service status     # 先检查状态
-.venv/bin/python cli.py service resume     # 恢复服务
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service status     # 先检查状态
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service resume     # 恢复服务
 ```
 
 `service resume` 会执行：启动服务 → 重新 bootstrap 初始化基线。
@@ -479,9 +538,11 @@ Bot：（解析输入提取 agent_id，读取 Agent 信息，更新 moss_source.
 用户：确认
 
 Bot：✅ 新 Agent 配置完成
-     发送「恢复跟单」以重新启动
+     重新启动前还需要完成两项必答风险参数：
+     1. 您是否需要设置跟单的资金比例？资金比例请输入 0%~100%，例如 30%、50%、100%。
+     2. 您是否需要设置止盈或者止损点？止损请输入 0%~100%，例如止损 20%；止盈请输入 0%~300%，例如止盈 20%。注意：止盈/止损按保证金盈亏百分比计算，不是价格涨跌幅；由轮询检查触发，非实时 tick，急速行情下实际盈亏可能超过设定值。
 
-用户：恢复跟单
+用户：（完成资金比例与止盈/止损问答后，确认恢复）
 
 Bot：（执行 service resume）
      ✅ 新 Agent 已生效，跟单已启动
@@ -490,11 +551,12 @@ Bot：（执行 service resume）
 
 对应 CLI：
 ```bash
-.venv/bin/python cli.py service status     # 读取当前 agent_id
-.venv/bin/python cli.py service pause      # 暂停 + 平仓
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service status     # 读取当前 agent_id
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service pause      # 暂停 + 平仓
 # 用户发送新 Agent 链接后：
-.venv/bin/python cli.py config set moss_source.agent_id agt_yyy
-.venv/bin/python cli.py service resume     # 恢复
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set moss_source.agent_id agt_yyy
+# 完成必答风险参数问答后：
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service resume     # 恢复
 ```
 
 **异常处理**：
@@ -537,7 +599,7 @@ Bot：（执行 config set follow_ratio 0.3）
 
 Bot：（执行 config show 读取当前 stop_loss_pct）
      当前止损设置：-10%（0 表示未设置）
-     请输入新的止损比例（如 -8%，输入 0 关闭止损）：
+     请输入新的止损比例（0%~100%，如 -8% 或 8%，输入 0 关闭止损）：
 
 用户：-8%
 
@@ -552,7 +614,7 @@ Bot：（执行 config set stop_loss_pct 8）
 
 Bot：（执行 config show 读取当前 take_profit_pct）
      当前止盈设置：20%（0 表示未设置）
-     请输入新的止盈比例（如 25%，输入 0 关闭止盈）：
+     请输入新的止盈比例（0%~300%，如 25%，输入 0 关闭止盈）：
 
 用户：25%
 
@@ -577,11 +639,11 @@ Bot：（执行 config set slippage_percent 2）
 
 对应 CLI：
 ```bash
-.venv/bin/python cli.py config show
-.venv/bin/python cli.py config set follow_ratio 0.3
-.venv/bin/python cli.py config set stop_loss_pct 8
-.venv/bin/python cli.py config set take_profit_pct 25
-.venv/bin/python cli.py config set slippage_percent 2
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config show
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set follow_ratio 0.3
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set stop_loss_pct 8
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set take_profit_pct 25
+.venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json config set slippage_percent 2
 ```
 
 **注意**：参数修改后无需重启服务，下次 delta 对齐时自动生效。但跟单比例变化会影响后续所有仓位计算，需告知用户。
@@ -625,9 +687,9 @@ Bot 发送确认提示，说明：
 [Bot 解析链接，展示 Agent 信息]
      ↓ 用户确认 / 换一个（循环）
 [配置跟单参数]
-  - 跟单比例
-  - 止损线
-  - 杠杆 / 滑点 / 币种过滤规则
+  - 必答：是否设置跟单资金比例 → 是则询问比例；否则设置为 100%
+  - 必答：是否设置止盈或者止损点 → 是则询问止盈/止损比例；否则关闭止盈止损
+  - 滑点 / 币种过滤规则
   - 确认摘要
      ↓ 确认开启
 [跟单中]
@@ -802,9 +864,9 @@ Bot 只是忠实地复制 Agent 的交易行为，不对交易结果负责，也
 **Q: 参数怎么填？各参数是什么意思？**
 | 参数 | 含义 | 建议值 |
 |------|------|--------|
-| 跟单比例 | Agent 仓位的跟随比例，50% 表示跟一半 | 保守 30-50%，激进 80-100% |
-| 止损线 | 亏损达到该比例时自动停止跟单 | 建议 -20% 至 -30% |
-| 止盈线 | 盈利达到该比例时自动停止跟单 | 可不设，或设 50%+ |
+| 跟单比例 | Agent 仓位的跟随比例，输入范围 0%~100%；配置写入小数，10% 写为 `follow_ratio=0.1` | 保守 30-50%，激进 80-100% |
+| 止损线 | 保证金亏损达到该比例时自动平仓，非价格跌幅；输入范围 0%~100%；配置写入百分比数值，20% 写为 `stop_loss_pct=20` | 建议 -20% 至 -30% |
+| 止盈线 | 保证金盈利达到该比例时自动平仓，非价格涨幅；输入范围 0%~300%；配置写入百分比数值，20% 写为 `take_profit_pct=20` | 可不设，或设 20%+ |
 | 滑点 | 下单时允许的最大价格偏差 | 默认 1.5% 即可 |
 
 **Q: 流程中途能退出吗？**
@@ -830,7 +892,7 @@ Bot 不提供投资建议，也不推荐具体的 Agent。建议你在 Moss 平�
 不建议设 100% 以上（超额跟单），可能放大风险。
 
 **Q: 止损线要不要设？**
-**强烈建议设置**。止损线可以防止极端行情下损失过大。推荐范围 -20% 至 -30%。即使你看好 Agent 策略，也建议设置一个较宽的止损作为安全网。设为 0 表示关闭止损。
+**强烈建议设置**。止损线可以防止极端行情下损失过大。推荐范围 -20% 至 -30%。这里的百分比是保证金亏损百分比，不是价格跌幅；服务按轮询检查，非实时 tick，急速行情下实际亏损可能超过设定值。即使你看好 Agent 策略，也建议设置一个较宽的止损作为安全网。设为 0 表示关闭止损。
 
 **Q: 能同时跟多个 Agent 吗？**
 目前每个实例只能跟一个 Agent。如需切换，先发送「切换 Agent」停止当前跟单，再配置新 Agent。如果想同时跟多个 Agent，可以部署多个 Bot 实例（使用不同的配置文件）。
@@ -877,7 +939,7 @@ Bot 不提供投资建议，也不推荐具体的 Agent。建议你在 Moss 平�
 ### 六、异常与错误
 
 **Q: 止损触发了，怎么回事？**
-说明你的跟单亏损已达到预设的止损线，跟单已自动停止。此时：
+说明你的跟单持仓保证金亏损已达到预设的止损线并触发自动处理。注意该阈值不是价格跌幅，且由轮询检查触发，急速行情下实际亏损可能超过设定值。此时：
 - 现有持仓需要用户自行在 Hyperliquid 上处理（Bot 不会自动平仓）
 - 可以在 Hyperliquid 上手动平仓或继续持有
 - 如需重新跟单，发送「恢复跟单」
@@ -939,6 +1001,7 @@ Bot 只支持跟单模式（复制 Moss Agent 的交易），不支持用户自�
 - When `check-auth` fails, explain which authorization is missing and provide the correct Hyperliquid UI URL
 - Never display the full private key — always mask it
 - When showing trade history, present the table output cleanly
+- Before starting or resuming a follow service, always ask and record the two required risk questions: whether to set follow capital ratio, and whether to set take-profit or stop-loss. After writing those settings, run `config confirm-risk --follow-ratio <answer> --stop-loss <answer> --take-profit <answer>`; `service start` / `service resume` will reject startup without this confirmation snapshot. This also applies after upgrade/rollback, even if the instance was configured or running before. Do not start if either answer is missing.
 - **FAQ 回答原则**：回答用户问题时，结合用户当前所处阶段（钱包设置/选Agent/配置参数/运行中）给出上下文相关的回复，不要机械地照搬 FAQ 原文，而是自然融入对话
 
 ### 防重复启动规则
@@ -974,6 +1037,11 @@ Bot 只支持跟单模式（复制 Moss Agent 的交易），不支持用户自�
    ps aux | grep "python.*cli.py.*service" | grep -v grep
    
    # Step 3: 如果发现同一钱包地址的服务已在运行，拒绝启动
+
+   # Step 4: 确认本次启动前已完成必答风险参数问答
+   # - 跟单资金比例：用户回答是/否；是则已写入 follow_ratio，否则已写入/确认 follow_ratio=1.0
+   # - 止盈/止损点：用户回答是/否；是则已写入 stop_loss_pct / take_profit_pct，否则二者已写入 0
+   # - 已执行 config confirm-risk --follow-ratio <用户回答> --stop-loss <用户回答> --take-profit <用户回答>，写入当前 Agent + follow_ratio + stop_loss_pct + take_profit_pct 快照
    ```
 
 4. **多账户管理**：
@@ -1005,15 +1073,18 @@ Bot 只支持跟单模式（复制 Moss Agent 的交易），不支持用户自�
 
 2. **升级前说明**
    - 明确展示当前版本（来自 `VERSION.json`）、最新版本（来自官方 manifest 的 `version` / `latest_version`）、主要 changelog。
-   - 告诉用户升级会短暂停止正在运行的跟单服务，但使用 `service stop`，并等待旧 PID 退出后再替换代码；不会平仓，不会清基线。
+   - 告诉用户升级前必须先关闭跟单服务，使用 `service stop` 停服务并等待旧 PID 退出后再替换代码；不会平仓，不会清基线。升级后不会直接启动，必须先重新确认资金比例和止盈止损。
    - 如用户选择稍后提醒，当天不再重复提醒；如用户忽略版本，执行 `update ignore <version>`。
 
 3. **升级执行命令**
    ```bash
    .venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json update status
    .venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json update check
+   .venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service stop
+   .venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json service status
    .venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json update apply --manifest-url <官方manifest> --yes
    ```
+   - **关键顺序**：如果 `service status` 显示 running，必须先执行 `service stop` 并确认状态变为 stopped，再执行 `update apply`。不要让 `update apply` 在 service running 时执行，因为 CLI 会把 `service_was_running=true` 记录进备份并在升级后自动 `service start`，导致绕过资金比例/止盈止损确认。
    - 如果使用本地升级包测试：
    ```bash
    .venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json update apply --package /path/to/package.tar.gz --version <version> --yes
@@ -1022,16 +1093,40 @@ Bot 只支持跟单模式（复制 Moss Agent 的交易），不支持用户自�
 
 4. **升级安全规则**
    - 升级前 CLI 会备份代码、`VERSION.json`、当前实例 config 和数据库到 `~/.hyperliquid-copy-trade/backups/update-<timestamp>/`。
-   - 升级后只恢复升级前已经 running 的服务；升级前 stopped/paused 的实例保持停止。
+   - Skill 升级流程必须让 `update apply` 看到的升级前服务状态为 stopped：先手动 `service stop`，再 `update apply`。因此正常对话流程中升级后应保持 stopped，不应自动恢复 running。
+   - 如果因旧 skill 或人工命令导致 `update apply` 在 running 状态下执行并自动重启，Bot 发现升级后状态为 running 时，必须立即提示“升级后未完成风险参数确认，不应继续运行”，先执行 `service stop` 停止跟单，然后进入资金比例和止盈止损确认流程。
    - 如果升级失败或用户要求回滚，使用：
    ```bash
    .venv/bin/python cli.py --config ~/.hyperliquid-copy-trade/<6位>/config_<6位>.json update rollback --yes
    ```
-   - 不要使用 `service pause` 进行升级停机；`pause` 会平仓并清基线，只用于用户主动暂停跟单。
+   - 不要使用 `service pause` 进行升级停机；`pause` 会平仓并清基线，只用于用户主动暂停跟单。升级前关闭服务只用 `service stop`。
 
-5. **用户话术**
-   - 升级确认前：说明“本次升级不会修改私钥配置，不会平仓；会先备份，再短暂停服务，升级后恢复原运行状态”。
-   - 升级完成后：输出版本变化、备份目录、服务最终状态，并建议观察 1-2 分钟确认 `service status` 正常。
+5. **升级后启动门禁**
+   - 升级完成后，不要直接问“要启动服务吗？”然后马上执行 `service start` / `service resume`。
+   - 升级完成后的默认状态应为 stopped。Bot 必须先读取当前配置并展示 `follow_ratio`、`stop_loss_pct`、`take_profit_pct`，再询问是否沿用或修改。
+   - 无论升级前实例是 running、stopped 还是 paused，只要升级后需要启动、恢复或继续跟单，都必须先重新提醒并确认两项风险配置：
+     1. “您是否需要设置跟单的资金比例？资金比例请输入 0%~100%，例如 30%、50%、100%。”资金比例范围 `0%~100%`，写入时转换为 `follow_ratio` 小数；例如 `10%` → `0.1`，`100%` → `1.0`。
+     2. “您是否需要设置止盈或者止损点？止损请输入 0%~100%，例如止损 20%；止盈请输入 0%~300%，例如止盈 20%。注意：止盈/止损按保证金盈亏百分比计算，不是价格涨跌幅；由轮询检查触发，非实时 tick，急速行情下实际盈亏可能超过设定值。”止损范围 `0%~100%`，止盈范围 `0%~300%`，写入时保持百分比数值；例如 `止损 10%` → `stop_loss_pct=10`，`止盈 100%` → `take_profit_pct=100`。
+   - 如果用户说“沿用当前配置”或“保持不变”，也必须先展示当前 `follow_ratio`、`stop_loss_pct`、`take_profit_pct`，并让用户明确确认后才算完成必答问答。
+   - 如果用户回复“启动/恢复/开启”，但升级后尚未完成上述两项确认，Bot 必须先进入风险参数问答，不得直接执行启动命令。
+   - 如果升级工具已自动恢复了升级前正在 running 的服务，Bot 必须先执行 `service stop` 让服务停下，再展示当前资金比例、止损、止盈，并提示用户确认或修改；不要让服务在未完成确认时继续运行，也不要追加其它推荐问题打断这个确认流程。
+   - 推荐升级完成话术：
+     ```
+     升级成功 ✅
+
+     • 新版本: <version>
+     • 服务状态: 已停止，等待风险参数确认后再启动
+
+     启动或继续跟单前，需要重新确认两项风险配置：
+     1. 您是否需要设置跟单的资金比例？资金比例请输入 0%~100%，例如 30%、50%、100%。当前为 <percent>%
+     2. 您是否需要设置止盈或者止损点？止损请输入 0%~100%，例如止损 20%；止盈请输入 0%~300%，例如止盈 20%。注意：止盈/止损按保证金盈亏百分比计算，不是价格涨跌幅；由轮询检查触发，非实时 tick，急速行情下实际盈亏可能超过设定值。当前止损 <x>% / 止盈 <y>%
+
+     可以回复“沿用当前配置”，或直接给新参数，例如“资金比例 50%，止损 10%，止盈 100%”。
+     ```
+
+6. **用户话术**
+   - 升级确认前：说明“本次升级不会修改私钥配置，不会平仓；会先备份，再停止服务并升级；升级后不会自动启动，需要重新确认资金比例和止盈止损后再启动”。
+   - 升级完成后：输出版本变化、备份目录、服务最终状态，并立即进入“升级后启动门禁”的两项风险配置确认；不要在未确认前直接启动服务，也不要先询问自动重启/watchdog。
 
 ### 自动重启 Watchdog 规则
 

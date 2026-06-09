@@ -82,6 +82,97 @@ def _set_service_desired_state(value: str) -> None:
     watchdog.set_desired_state(value)
 
 
+_RISK_PARAM_KEYS = {
+    "follow_ratio",
+    "stop_loss_pct",
+    "take_profit_pct",
+    "moss_source.agent_id",
+}
+
+
+def _arg_value(args: list[str], name: str) -> str | None:
+    if name not in args:
+        return None
+    idx = args.index(name)
+    if idx + 1 >= len(args):
+        return None
+    return args[idx + 1]
+
+
+def _parse_percent_or_ratio(raw: str, *, ratio: bool) -> float:
+    text = str(raw).strip()
+    is_percent = text.endswith("%")
+    if is_percent:
+        text = text[:-1].strip()
+    value = float(text)
+    if ratio:
+        if is_percent or value > 1:
+            value = value / 100.0
+        if not 0 <= value <= 1:
+            raise ValueError("follow ratio must be between 0% and 100%")
+        return value
+    if value < 0:
+        value = abs(value)
+    return value
+
+
+def _risk_confirmation_snapshot(config_data: dict | None = None) -> dict:
+    config_data = config_data or cfg.load_config()
+    moss_cfg = config_data.get("moss_source", {})
+    if not isinstance(moss_cfg, dict):
+        moss_cfg = {}
+    return {
+        "agent_id": moss_cfg.get("agent_id", ""),
+        "follow_ratio": config_data.get("follow_ratio", 1.0),
+        "stop_loss_pct": config_data.get("stop_loss_pct", 0),
+        "take_profit_pct": config_data.get("take_profit_pct", 0),
+    }
+
+
+def _risk_params_are_confirmed(config_data: dict | None = None) -> bool:
+    config_data = config_data or cfg.load_config()
+    confirmation = config_data.get("risk_params_confirmed")
+    if not isinstance(confirmation, dict) or not confirmation.get("confirmed"):
+        return False
+    expected = _risk_confirmation_snapshot(config_data)
+    return all(confirmation.get(k) == v for k, v in expected.items())
+
+
+def _format_risk_params(config_data: dict | None = None) -> str:
+    snap = _risk_confirmation_snapshot(config_data)
+    try:
+        ratio_pct = float(snap["follow_ratio"]) * 100
+        ratio_text = f"{ratio_pct:g}%"
+    except (TypeError, ValueError):
+        ratio_text = str(snap["follow_ratio"])
+    return (
+        f"Agent={snap['agent_id'] or '(未设置)'}, "
+        f"资金比例={ratio_text}, "
+        f"止损={snap['stop_loss_pct']}%, "
+        f"止盈={snap['take_profit_pct']}%"
+    )
+
+
+def _require_risk_params_confirmed() -> None:
+    config_data = cfg.load_config()
+    if _risk_params_are_confirmed(config_data):
+        return
+    config_path = cfg.get_config_path()
+    print("ERROR: 启动跟单前必须先确认资金比例和止盈/止损配置。")
+    print(f"当前配置: {_format_risk_params(config_data)}")
+    print()
+    print("请先在对话中询问用户：")
+    print("  1. 您是否需要设置跟单的资金比例？范围 0%~100%，例如 30%、50%、100%。")
+    print("  2. 您是否需要设置止损？范围 0%~100%，例如止损 20%。")
+    print("  3. 您是否需要设置止盈？范围 0%~300%，例如止盈 20%。")
+    print("  注意：止盈/止损按保证金盈亏百分比计算，不是价格涨跌幅；由轮询检查触发，非实时 tick，急速行情下实际盈亏可能超过设定值。")
+    print()
+    print("按用户回答执行确认命令（必须显式带三个答案）：")
+    print(f"  .venv/bin/python cli.py --config {config_path} config confirm-risk --follow-ratio 100% --stop-loss 0 --take-profit 0")
+    print("然后再启动服务。")
+    raise SystemExit(2)
+
+
 def cmd_service(args: list[str]) -> None:
     if not args:
         print("Usage: service <start|stop|status|pause|resume|switch|watchdog>")
@@ -96,6 +187,7 @@ def cmd_service(args: list[str]) -> None:
     elif subcmd == "switch":
         cmd_service_switch()
     elif subcmd == "start":
+        _require_risk_params_confirmed()
         _set_service_desired_state("running")
         _run_service("start")
     elif subcmd == "stop":
@@ -147,6 +239,7 @@ def cmd_service_pause() -> None:
 
 def cmd_service_resume() -> None:
     """恢复跟单：启动服务（自动重建基线）。"""
+    _require_risk_params_confirmed()
     _set_service_desired_state("running")
     print("正在恢复跟单...")
     _run_service("start")
@@ -317,7 +410,59 @@ def cmd_config_set(args: list[str]) -> None:
         parsed = value
 
     cfg.set_value(key, parsed)
+    if key in _RISK_PARAM_KEYS:
+        cfg.set_value("risk_params_confirmed", False)
+        print(
+            "Risk parameter confirmation cleared; run "
+            "`config confirm-risk --follow-ratio <0%~100%> --stop-loss <0%~100%> --take-profit <0%~300%>` "
+            "after user confirms all risk settings."
+        )
     print(f"Set {key} = {parsed!r}")
+
+
+def cmd_config_confirm_risk(args: list[str]) -> None:
+    raw_follow_ratio = _arg_value(args, "--follow-ratio")
+    raw_stop_loss = _arg_value(args, "--stop-loss")
+    raw_take_profit = _arg_value(args, "--take-profit")
+    if raw_follow_ratio is None or raw_stop_loss is None or raw_take_profit is None:
+        raise SystemExit(
+            "ERROR: confirm-risk requires explicit user answers for all risk params:\n"
+            "  config confirm-risk --follow-ratio <0%~100%> --stop-loss <0%~100%> --take-profit <0%~300%>\n"
+            "Required prompts:\n"
+            "  1. 资金比例请输入 0%~100%，例如 30%、50%、100%。\n"
+            "  2. 止损请输入 0%~100%，例如止损 20%。\n"
+            "  3. 止盈请输入 0%~300%，例如止盈 20%。\n"
+            "  注意：止盈/止损按保证金盈亏百分比计算，不是价格涨跌幅；由轮询检查触发，非实时 tick，急速行情下实际盈亏可能超过设定值。"
+        )
+    try:
+        follow_ratio = _parse_percent_or_ratio(raw_follow_ratio, ratio=True)
+        stop_loss_pct = _parse_percent_or_ratio(raw_stop_loss, ratio=False)
+        take_profit_pct = _parse_percent_or_ratio(raw_take_profit, ratio=False)
+    except (TypeError, ValueError) as exc:
+        raise SystemExit(f"ERROR: invalid risk parameter: {exc}") from exc
+    if not 0 <= stop_loss_pct <= 100:
+        raise SystemExit("ERROR: stop-loss must be between 0% and 100%.")
+    if not 0 <= take_profit_pct <= 300:
+        raise SystemExit("ERROR: take-profit must be between 0% and 300%.")
+
+    cfg.set_value("follow_ratio", follow_ratio)
+    cfg.set_value("stop_loss_pct", stop_loss_pct)
+    cfg.set_value("take_profit_pct", take_profit_pct)
+    config_data = cfg.load_config()
+    snap = _risk_confirmation_snapshot(config_data)
+    if not snap.get("agent_id"):
+        raise SystemExit("ERROR: moss_source.agent_id is not set; configure the Agent before confirming risk params.")
+    confirmation = {
+        **snap,
+        "confirmed": True,
+        "follow_ratio_answer": str(raw_follow_ratio),
+        "stop_loss_answer": str(raw_stop_loss),
+        "take_profit_answer": str(raw_take_profit),
+        "confirmed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    cfg.set_value("risk_params_confirmed", confirmation)
+    print("Risk parameters confirmed for service start:")
+    print(f"  {_format_risk_params(cfg.load_config())}")
 
 
 def cmd_baseline_show() -> None:
@@ -743,6 +888,21 @@ def _find_arg(args: list[str], name: str) -> str | None:
 
 def _has_flag(args: list[str], name: str) -> bool:
     return name in args
+
+
+def _print_start_risk_confirmation_notice() -> None:
+    """Remind operators to confirm risk params before restarting after update."""
+    try:
+        follow_ratio = float(cfg.get("follow_ratio", 1.0))
+    except (TypeError, ValueError):
+        follow_ratio = 1.0
+    stop_loss_pct = cfg.get("stop_loss_pct", 0)
+    take_profit_pct = cfg.get("take_profit_pct", 0)
+    print("Risk parameters must be confirmed before starting service:")
+    print(f"  follow_ratio: {follow_ratio:g} ({follow_ratio * 100:g}%)")
+    print(f"  stop_loss_pct: {stop_loss_pct}")
+    print(f"  take_profit_pct: {take_profit_pct}")
+    print("Ask the user whether to keep or change follow ratio and SL/TP, then run service start.")
 
 
 def _config_update_manifest_url() -> str:
@@ -1204,11 +1364,14 @@ def cmd_update_apply(args: list[str]) -> None:
         _save_update_state(state)
 
         if service_was_running:
-            print("Restarting service after update ...")
-            _call_service("start")
-            print(_service_status_text())
+            print(
+                "Service was running before update; leaving it stopped after update. "
+                "Confirm follow_ratio/stop_loss_pct/take_profit_pct before starting."
+            )
         else:
             print("Service was not running before update; leaving it stopped.")
+        if has_config:
+            _print_start_risk_confirmation_notice()
         print("Update applied.")
     finally:
         if maintenance_enabled:
@@ -1345,6 +1508,8 @@ Commands:
   alerts ack-all                        Mark all alerts as read
   config show                           Show current configuration
   config set <key> <value>              Set a config value
+  config confirm-risk --follow-ratio R --stop-loss SL --take-profit TP
+                                        Confirm follow ratio and SL/TP before start
   config check-auth                     Check Agent and Builder authorization status
   config wallet-generate                Generate a new wallet (private_key + wallet_address)
   baseline show                         Show current baseline snapshot
@@ -1389,6 +1554,8 @@ def main() -> None:
             cmd_config_show()
         elif rest[0] == "set":
             cmd_config_set(rest[1:])
+        elif rest[0] == "confirm-risk":
+            cmd_config_confirm_risk(rest[1:])
         elif rest[0] == "wallet-generate":
             cmd_wallet_generate()
         elif rest[0] == "check-auth":
