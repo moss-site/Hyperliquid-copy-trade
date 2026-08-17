@@ -2,24 +2,113 @@
 启动前和下单前的授权校验。
 
 检查项：
-1. main_address 是否已将 wallet_address 授权为 Agent（extraAgents）
-2. main_address 是否已授权 builder_address（approvedBuilders）
+1. main_address 是否使用手动（标准）账户模式
+2. main_address 是否已将 wallet_address 授权为 Agent（userRole/extraAgents）
+3. main_address 是否已授权 builder_address（approvedBuilders）
 """
 
 import logging
+import re
 import time
 
 from . import config as cfg
 
 logger = logging.getLogger("follow_agent.preflight")
+_EVM_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+_ACCOUNT_ABSTRACTION_LABELS = {
+    "unifiedAccount": "统一账户",
+    "portfolioMargin": "投资组合保证金",
+}
 
 
-def _post_info(api_url: str, payload: dict) -> list | dict:
+def _post_info(api_url: str, payload: dict) -> list | dict | str:
     import requests
 
     r = requests.post(f"{api_url}/info", json=payload, timeout=10)
     r.raise_for_status()
     return r.json()
+
+
+def _is_evm_address(value: str) -> bool:
+    return bool(_EVM_ADDRESS_RE.match(str(value or "").strip()))
+
+
+def _validate_config_completeness(
+    *,
+    main_address: str,
+    wallet_address: str,
+    errors: list[str],
+) -> None:
+    """Fail before auth calls when required runtime fields are incomplete."""
+    api_url = str(cfg.get("hl_api_url", "") or "").strip()
+    if not api_url:
+        errors.append("hl_api_url 未配置：请先选择 Hyperliquid 网络。")
+        logger.error(errors[-1])
+
+    if main_address and not _is_evm_address(main_address):
+        errors.append("main_address 格式不正确：必须是 0x 开头的 EVM 地址。")
+        logger.error(errors[-1])
+    if wallet_address and not _is_evm_address(wallet_address):
+        errors.append("wallet_address 格式不正确：必须是 0x 开头的 EVM 地址。")
+        logger.error(errors[-1])
+
+
+def _normalize_account_abstraction(response: object) -> str:
+    """兼容 info 端点的新旧响应；未知或缺字段按手动（标准）模式处理。"""
+    if isinstance(response, str):
+        mode = response
+    elif isinstance(response, dict):
+        mode = (
+            response.get("abstraction")
+            or response.get("mode")
+            or response.get("userAbstraction")
+        )
+    else:
+        mode = None
+    return mode if mode in _ACCOUNT_ABSTRACTION_LABELS else "disabled"
+
+
+def get_account_abstraction() -> str:
+    """查询当前账户抽象模式；缺字段兼容为手动（标准）模式。"""
+    api_url = cfg.get("hl_api_url", "https://api.hyperliquid-testnet.xyz")
+    account = (cfg.get("main_address", "") or cfg.get("wallet_address", "")).lower()
+    if not account:
+        raise ValueError("账户地址未配置")
+    response = _post_info(
+        api_url,
+        {"type": "userAbstraction", "user": account},
+    )
+    return _normalize_account_abstraction(response)
+
+
+def check_account_abstraction(raise_on_fail: bool = True) -> bool:
+    """阻断统一账户/投资组合保证金模式；查询异常仅 warning 并放行。"""
+    account = (cfg.get("main_address", "") or cfg.get("wallet_address", "")).lower()
+    if not account:
+        logger.warning("账户地址未配置，跳过账户模式查询")
+        return True
+
+    try:
+        mode = get_account_abstraction()
+    except Exception as e:
+        logger.warning("账户模式查询失败，按手动(标准)模式继续启动: %s", e)
+        return True
+
+    label = _ACCOUNT_ABSTRACTION_LABELS.get(mode)
+    if label:
+        msg = (
+            f"当前账户为{label}模式，跟单服务要求手动(标准)模式；"
+            "请在 Hyperliquid 设置切换，或用 SDK "
+            'userSetAbstraction(user, "disabled") 切换'
+        )
+        logger.error(msg)
+        if raise_on_fail:
+            raise RuntimeError(msg)
+        return False
+
+    logger.info("Account abstraction OK: account=%s mode=%s", account[:10], mode)
+    return True
 
 
 def check_authorization(raise_on_fail: bool = True) -> bool:
@@ -36,8 +125,8 @@ def check_authorization(raise_on_fail: bool = True) -> bool:
     api_url = cfg.get("hl_api_url", "https://api.hyperliquid-testnet.xyz")
     main_address = cfg.get("main_address", "").lower()
     wallet_address = cfg.get("wallet_address", "").lower()
+    private_key = cfg.get("private_key", "")
     builder_address = cfg.get_builder_address().lower()
-
     errors: list[str] = []
     if not main_address:
         msg = "main_address 未配置：请先配置主钱包地址。"
@@ -47,6 +136,40 @@ def check_authorization(raise_on_fail: bool = True) -> bool:
         msg = "wallet_address 未配置：请先生成 Agent Wallet。"
         logger.error(msg)
         errors.append(msg)
+    _validate_config_completeness(
+        main_address=main_address,
+        wallet_address=wallet_address,
+        errors=errors,
+    )
+    if errors:
+        if raise_on_fail:
+            raise RuntimeError("授权校验失败:\n" + "\n".join(f"  - {e}" for e in errors))
+        return False
+
+    # ── 0. 私钥地址一致性校验 ─────────────────────────────────────────────
+    if private_key and wallet_address:
+        try:
+            from eth_account import Account
+
+            signer = Account.from_key(private_key).address.lower()
+            if signer != wallet_address:
+                msg = (
+                    f"private_key 地址不匹配：私钥推导地址 {signer} != "
+                    f"wallet_address {wallet_address}。"
+                )
+                logger.error(msg)
+                errors.append(msg)
+            else:
+                logger.info("Wallet key OK: wallet=%s", wallet_address[:10])
+        except Exception as e:
+            msg = f"private_key 校验失败: {e}"
+            logger.error(msg)
+            errors.append(msg)
+    elif not private_key:
+        msg = "private_key 未配置：无法校验交易账号私钥。"
+        logger.error(msg)
+        errors.append(msg)
+
     if errors:
         if raise_on_fail:
             raise RuntimeError("授权校验失败:\n" + "\n".join(f"  - {e}" for e in errors))

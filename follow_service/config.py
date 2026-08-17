@@ -184,6 +184,11 @@ def get_moss_source_config(migrate_bot_id: bool = False) -> dict:
     return moss_cfg
 
 
+
+def is_builder_fee_enabled() -> bool:
+    """Builder fee is always enabled in standard Agent Wallet mode."""
+    return True
+
 def set_value(key: str, value) -> None:
     """设置配置项。支持 'a.b.c' 形式的嵌套路径写入；中间层不存在时自动创建为 dict。"""
     parts = key.split(".")

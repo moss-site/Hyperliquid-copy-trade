@@ -10,23 +10,33 @@ Usage:
 import asyncio
 import os
 import signal
+import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
 from . import config as cfg
 from . import database as db
 from . import hyper_coins
+from .agent_market import (
+    AgentMarketError,
+    get_open_positions,
+    get_scope_balance,
+    inspect_agent,
+    persist_report,
+)
 from .logger_setup import setup_logger
 from .balance_tracker import run_balance_tracker, run_sltp_checker
 from .hyper_coins import run_hyper_coin_refresher
 from .moss_poller import run_moss_poller
 from .moss_reporter import run_moss_reporter
 from .moss_ws import run_moss_ws
-from .preflight import check_authorization
+from .preflight import check_account_abstraction, check_authorization
 
 
 logger = setup_logger()
+_STARTUP_CHECK_SECS = 2.0
 
 
 def _pid_file() -> Path:
@@ -68,14 +78,39 @@ def _is_running(pid: int) -> bool:
         return False
 
 
+def _desired_state() -> str:
+    try:
+        from . import watchdog
+
+        return str(watchdog.load_state().get("desired_state") or "stopped")
+    except Exception:
+        return "stopped"
+
+
+def _print_failure_hints() -> None:
+    log_dir = Path(cfg.get("log_dir", str(cfg.get_instance_dir() / "logs"))).expanduser()
+    print(f"Logs: {log_dir / 'service.log'}")
+    print(f"stderr: {log_dir / 'stderr.log'}")
+    if sys.platform == "darwin":
+        print("macOS crash reports: ~/Library/Logs/DiagnosticReports")
+
+
 def cmd_status() -> None:
     instance_id = cfg.get_instance_id()
     pid = _read_pid()
     if pid and _is_running(pid):
         print(f"running (pid={pid}, instance={instance_id})")
     else:
-        _remove_pid(pid)
-        print(f"stopped (instance={instance_id})")
+        desired = _desired_state()
+        if desired == "running":
+            if pid:
+                print(f"exited unexpectedly (last_pid={pid}, instance={instance_id})")
+            else:
+                print(f"exited unexpectedly (instance={instance_id})")
+            _print_failure_hints()
+        else:
+            _remove_pid(pid)
+            print(f"stopped (instance={instance_id})")
     auth_ok = check_authorization(raise_on_fail=False)
     print(f"authorization={'ok' if auth_ok else 'failed'}")
 
@@ -134,6 +169,11 @@ def cmd_start() -> None:
     else:
         logger.info("allowed_coins is empty; Hyper coin cache is authoritative")
 
+    if not check_account_abstraction(raise_on_fail=False):
+        logger.error("Service startup aborted: unsupported account abstraction")
+        print("ERROR: 当前账户模式不受支持，服务未启动；请切换到手动(标准)模式后重试。")
+        sys.exit(1)
+
     # Fail fast: 未授权时启动只会持续下单失败，直接阻塞启动并让用户先修配置/授权。
     if not check_authorization(raise_on_fail=False):
         logger.error("Service startup aborted: authorization check failed")
@@ -149,24 +189,108 @@ def cmd_start() -> None:
         print("ERROR: 无法获取 Hyperliquid 支持币种列表，请检查网络或 hl_api_url，服务未启动。")
         sys.exit(1)
 
-    # Fork to background
-    child_pid = os.fork()
-    if child_pid > 0:
-        _write_pid(child_pid)
-        print(f"Service started (pid={child_pid}, instance={instance_id})")
-        print(f"Config: {config_path}")
-        print(f"Logs: {cfg.get('log_dir')}/service.log")
-        return
+    if moss_cfg.get("enabled"):
+        try:
+            market = inspect_agent(agent_id, persist=False, refresh_cache=False)
+            scope_agent = str(moss_cfg.get("market_scope_agent_id") or "")
+            is_new_selection = scope_agent not in {"", agent_id} or (
+                not scope_agent and not db.has_baseline(agent_id)
+            )
+            if is_new_selection:
+                remaining = get_open_positions()
+                if remaining:
+                    raise AgentMarketError(
+                        "选择新 Agent 前必须关闭全部老持仓；仍有仓位: "
+                        + ", ".join(sorted(remaining))
+                    )
+            persist_report(market)
+            logger.info(
+                "Agent market validated: agent=%s scope=%s fills=%d symbols=%s",
+                market.agent_id, market.market_scope, market.sample_size, market.symbols,
+            )
+            print(
+                f"Agent 类型验证通过: scope={market.market_scope}, "
+                f"最近成交={market.sample_size}, symbols={','.join(market.symbols)}"
+            )
+            balance = get_scope_balance(market.market_scope)
+            if balance["account_value"] <= 0:
+                target = "xyz dex" if market.market_scope == "xyz" else "默认 Perps"
+                raise AgentMarketError(
+                    f"{target} 没有跟单资金；请先运行 funds show，"
+                    "确认后将旧账户的 withdrawable 划入目标账户"
+                )
+            print(
+                f"目标账户资金: accountValue={balance['account_value']:.4f}, "
+                f"withdrawable={balance['withdrawable']:.4f} USDC"
+            )
+        except AgentMarketError as e:
+            logger.error("Service startup aborted: Agent market validation failed: %s", e)
+            print(f"ERROR: Agent 历史验证失败，服务未启动: {e}")
+            sys.exit(1)
 
-    # --- child process ---
-    os.setsid()
-    _write_pid(os.getpid())
+    proc = _spawn_service_process(config_path)
+    _write_pid(proc.pid)
+    time.sleep(_STARTUP_CHECK_SECS)
+    rc = proc.poll()
+    if rc is not None:
+        _remove_pid(proc.pid)
+        print(f"ERROR: service exited during startup (exit_code={rc}, instance={instance_id})")
+        _print_failure_hints()
+        sys.exit(rc or 1)
 
-    # Redirect stdio
+    print(f"Service started (pid={proc.pid}, instance={instance_id})")
+    print(f"Config: {config_path}")
+    print(f"Logs: {cfg.get('log_dir')}/service.log")
+
+
+def _spawn_service_process(config_path: Path) -> subprocess.Popen:
+    """Start the long-running service in a fresh interpreter.
+
+    macOS is not fork-safe once Python or native libraries have started
+    threads. Use subprocess + start_new_session (fork+exec under the hood)
+    instead of running service code in a bare forked child.
+    """
     log_dir = Path(cfg.get("log_dir", str(cfg.get_instance_dir() / "logs"))).expanduser()
     log_dir.mkdir(parents=True, exist_ok=True)
-    sys.stdout = open(log_dir / "stdout.log", "a")
-    sys.stderr = open(log_dir / "stderr.log", "a")
+    env = os.environ.copy()
+    resolved_config = str(config_path.expanduser().resolve())
+    env["FOLLOW_CONFIG"] = resolved_config
+    stdout = open(log_dir / "stdout.log", "a")
+    stderr = open(log_dir / "stderr.log", "a")
+    try:
+        return subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "follow_service.main",
+                "run",
+                "--config",
+                resolved_config,
+            ],
+            cwd=Path(__file__).resolve().parent.parent,
+            env=env,
+            stdout=stdout,
+            stderr=stderr,
+            text=True,
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        stdout.close()
+        stderr.close()
+
+
+def cmd_run() -> None:
+    """Run the service foreground loop. Intended for subprocess start."""
+    instance_id = cfg.get_instance_id()
+    config_path = cfg.get_config_path()
+    logger.info("Hyperliquid Copy Trade service starting (pid=%s)", os.getpid())
+    logger.info("Running instance=%s config=%s", instance_id, config_path)
+    _write_pid(os.getpid())
+
+    cfg.ensure_dirs()
+    db.init_db()
+    moss_cfg = cfg.get_moss_source_config(migrate_bot_id=True)
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -181,8 +305,6 @@ def cmd_start() -> None:
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
     signal.signal(signal.SIGINT, _handle_sigterm)
-
-    logger.info("Hyperliquid Copy Trade service starting (pid=%s)", os.getpid())
 
     async def _run_all() -> None:
         logger.info("Starting services ...")
@@ -226,6 +348,8 @@ def main() -> None:
     cmd = args[0] if args else "status"
     if cmd == "start":
         cmd_start()
+    elif cmd == "run":
+        cmd_run()
     elif cmd == "stop":
         cmd_stop()
     elif cmd == "status":
